@@ -1,0 +1,16 @@
+# Required installations for ML + API + Realtime data
+
+pip install numpy pandas scikit-learn tensorflow
+
+
+pip install fastapi uvicorn
+
+
+pip install joblib
+
+
+pip install yfinance requests
+
+
+pip install jupyter notebook
+
