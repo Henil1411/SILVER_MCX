@@ -1,0 +1,174 @@
+"""
+MCX Silver Complete ML Pipeline with Streamlit Interface
+Tomorrow prediction FIXED version
+"""
+
+import os, re, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import timedelta
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, mean_squared_error, mean_absolute_error
+from sklearn.linear_model import SGDRegressor, SGDClassifier
+import joblib
+import streamlit as st
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+OUT_DIR = "mcx_results"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+def kalman_smooth(signal, q=1e-5, r=1e-2):
+    n = len(signal)
+    xhat = np.zeros(n)
+    P = np.zeros(n)
+    xhat[0] = signal[0]
+    P[0] = 1.0
+    for k in range(1, n):
+        P_minus = P[k-1] + q
+        K = P_minus / (P_minus + r + 1e-12)
+        xhat[k] = xhat[k-1] + K * (signal[k] - xhat[k-1])
+        P[k] = (1 - K) * P_minus
+    return xhat
+
+def safe_numeric(s):
+    if isinstance(s, str):
+        s = re.sub(r"[^0-9.\-eE]", "", s)
+        try:
+            return float(s)
+        except:
+            return np.nan
+    return s
+
+def engineer_features(df):
+    df = df.copy()
+    df["close_kf"] = kalman_smooth(df["Close"].values)
+
+    df["ret_1"] = df["close_kf"].pct_change()
+    df["ret_5"] = df["close_kf"].pct_change(5)
+    df["ret_10"] = df["close_kf"].pct_change(10)
+
+    for w in [5, 10, 20, 50]:
+        df[f"sma_{w}"] = df["close_kf"].rolling(w).mean()
+        df[f"ema_{w}"] = df["close_kf"].ewm(span=w, adjust=False).mean()
+
+    delta = df["close_kf"].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    rs = up.ewm(com=13, adjust=False).mean() / (down.ewm(com=13, adjust=False).mean() + 1e-12)
+    df["rsi_14"] = 100 - (100 / (1 + rs))
+
+    for lag in [1, 2, 3, 5, 10]:
+        df[f"ret_lag_{lag}"] = df["ret_1"].shift(lag)
+
+    return df
+
+def load_and_prepare_data(uploaded_file):
+    df_raw = pd.read_csv(uploaded_file)
+    df_raw.columns = [c.lower().strip() for c in df_raw.columns]
+
+    df = pd.DataFrame()
+    df["Date"] = pd.to_datetime(df_raw.iloc[:, 0], dayfirst=True, errors="coerce")
+    df["Close"] = df_raw.iloc[:, 1].apply(safe_numeric)
+
+    df = df.dropna().sort_values("Date").reset_index(drop=True)
+    return df
+
+# ============================================================================
+# TRAINING
+# ============================================================================
+def train_models(df):
+    df_feat = engineer_features(df).dropna()
+    df_feat["target_ret"] = df_feat["close_kf"].shift(-1) / df_feat["close_kf"] - 1
+    df_feat["target_dir"] = (df_feat["target_ret"] > 0).astype(int)
+    df_feat = df_feat.dropna()
+
+    exclude = ["Date", "Close", "close_kf", "target_ret", "target_dir"]
+    features = [c for c in df_feat.columns if c not in exclude]
+
+    X = df_feat[features].values
+    y_ret = df_feat["target_ret"].values
+    y_dir = df_feat["target_dir"].values
+
+    split = int(len(X) * 0.7)
+    X_train, X_test = X[:split], X[split:]
+    y_ret_train, y_dir_train = y_ret[:split], y_dir[:split]
+
+    scaler = StandardScaler().fit(X_train)
+    X_train_s = scaler.transform(X_train)
+
+    reg = SGDRegressor(random_state=42)
+    clf = SGDClassifier(loss="log_loss", random_state=42)
+
+    reg.partial_fit(X_train_s, y_ret_train)
+    clf.partial_fit(X_train_s, y_dir_train, classes=[0, 1])
+
+    joblib.dump(reg, f"{OUT_DIR}/online_reg_model.joblib")
+    joblib.dump(clf, f"{OUT_DIR}/online_clf_model.joblib")
+    joblib.dump(scaler, f"{OUT_DIR}/scaler.joblib")
+    joblib.dump(features, f"{OUT_DIR}/feature_cols.joblib")
+
+# ============================================================================
+# TOMORROW PREDICTION (FIXED)
+# ============================================================================
+def predict_tomorrow(df):
+    scaler = joblib.load(f"{OUT_DIR}/scaler.joblib")
+    reg = joblib.load(f"{OUT_DIR}/online_reg_model.joblib")
+    clf = joblib.load(f"{OUT_DIR}/online_clf_model.joblib")
+    features = joblib.load(f"{OUT_DIR}/feature_cols.joblib")
+
+    df_feat = engineer_features(df).dropna()
+    latest = df_feat.iloc[-1]
+
+    current_price = latest["Close"]          # ✅ RAW EXCEL PRICE
+    tomorrow_date = latest["Date"] + timedelta(days=1)
+
+    X = scaler.transform([latest[features].values])
+    pred_ret = reg.predict(X)[0]
+
+    # ✅ Direction aligned with return
+    pred_dir = 1 if pred_ret >= 0 else 0
+
+    pred_price = current_price * (1 + pred_ret)
+
+    try:
+        proba = clf.predict_proba(X)[0][pred_dir] * 100
+    except:
+        proba = None
+
+    return tomorrow_date, current_price, pred_price, pred_ret, pred_dir, proba
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+st.set_page_config("MCX Silver Predictor", layout="wide")
+st.title("📈 MCX Silver Tomorrow Prediction")
+
+file = st.file_uploader("Upload CSV", type=["csv"])
+
+if file:
+    df = load_and_prepare_data(file)
+    st.metric("Last Close (Excel)", f"₹{df['Close'].iloc[-1]:.2f}")
+
+    if st.button("Train Model"):
+        train_models(df)
+        st.success("Model trained")
+
+    if st.button("Predict Tomorrow"):
+        tdate, cprice, pprice, pret, pdir, conf = predict_tomorrow(df)
+
+        st.markdown("## 🔮 Tomorrow Forecast")
+        st.metric("Tomorrow Date", tdate.strftime("%Y-%m-%d"))
+        st.metric("Direction", "📈 UP" if pdir == 1 else "📉 DOWN")
+        st.metric("Expected Return", f"{pret*100:.2f}%")
+        st.metric("Predicted Price", f"₹{pprice:.2f}")
+        if conf:
+            st.metric("Confidence", f"{conf:.1f}%")

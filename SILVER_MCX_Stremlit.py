@@ -1,462 +1,649 @@
-# app.py - Streamlit app for streaming-style trend + magnitude predictions
-# Usage:
-#   pip install streamlit pandas numpy scikit-learn matplotlib joblib xgboost
-#   streamlit run app.py
+"""
+MCX Silver Complete ML Pipeline with Streamlit Interface
+Includes tomorrow's prediction capability
+Data format: Date, Price, Open, High, Low, Vol., Change %
 
-import streamlit as st
-import pandas as pd
+Run with: streamlit run app.py
+"""
+
+import os, re, math, warnings
 import numpy as np
-import os, re, joblib
-from datetime import datetime
+import pandas as pd
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, mean_squared_error, mean_absolute_error
 from sklearn.linear_model import SGDRegressor, SGDClassifier
-from sklearn.metrics import mean_squared_error, mean_absolute_error, accuracy_score, f1_score
-import warnings
+import joblib
+import streamlit as st
+
 warnings.filterwarnings("ignore")
+np.random.seed(42)
 
-DEFAULT_PATHS = [
-    "/mnt/data/streaming_model_results/streaming_sim_results.csv",
-    "/mnt/data/MCX_SILVER.csv",
-    "/content/MCX_SILVER.csv"
-]
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+OUT_DIR = "mcx_results"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-st.set_page_config(layout="wide", page_title="Streaming Trend Predictor")
-
-st.title("Streaming Trend Predictor — Direction & Magnitude")
-
-# ---------------------------
-# Utilities
-# ---------------------------
-def safe_to_numeric(s):
-    if isinstance(s, str):
-        s2 = re.sub(r"[^\d\.\-eE]", "", s)
-        try:
-            return float(s2)
-        except:
-            return np.nan
-    return s
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def kalman_smooth(signal, q=1e-5, r=1e-2):
+    """Kalman filter for noise reduction"""
     n = len(signal)
     xhat = np.zeros(n)
     P = np.zeros(n)
     xhat[0] = signal[0]
     P[0] = 1.0
+    
     for k in range(1, n):
         xhat_minus = xhat[k-1]
         P_minus = P[k-1] + q
         K = P_minus / (P_minus + r + 1e-12)
         xhat[k] = xhat_minus + K * (signal[k] - xhat_minus)
         P[k] = (1 - K) * P_minus
+    
     return xhat
 
-def default_load_csv():
-    for p in DEFAULT_PATHS:
-        if os.path.exists(p):
-            try:
-                df = pd.read_csv(p)
-                return df, p
-            except:
-                pass
-    return None, None
+def safe_numeric(s):
+    """Convert string to numeric, handling special characters"""
+    if isinstance(s, str):
+        s = re.sub(r"[^0-9.\-eE]", "", s)
+        try:
+            return float(s)
+        except:
+            return np.nan
+    return s
 
-def prepare_features(df):
-    # Normalize column names
+def engineer_features(df):
+    """Apply feature engineering to dataframe"""
     df = df.copy()
-    df.columns = [re.sub(r"[^0-9A-Za-z]+", "_", str(c)).lower() for c in df.columns]
-
-    date_col = next((c for c in df.columns if "date" in c), df.columns[0])
-    close_col = next((c for c in df.columns if "close" in c or "ltp" in c or "settle" in c), None)
-    if close_col is None:
-        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        close_col = numeric_cols[0] if numeric_cols else df.columns[1]
-
-    df = df[[date_col, close_col]].rename(columns={date_col: "Date", close_col: "Close"})
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
-    df["Close"] = df["Close"].apply(safe_to_numeric)
-    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
-
-    # smoothing + features
+    
+    # Apply Kalman smoothing
     df["close_kf"] = kalman_smooth(df["Close"].values, q=1e-5, r=1e-2)
+    
+    # Returns
     df["ret_1"] = df["close_kf"].pct_change()
     df["logret"] = np.log(df["close_kf"]).diff()
-
-    for w in (5, 10, 20, 50):
+    df["ret_5"] = df["close_kf"].pct_change(5)
+    df["ret_10"] = df["close_kf"].pct_change(10)
+    
+    # Moving averages
+    for w in [5, 10, 20, 50]:
         df[f"sma_{w}"] = df["close_kf"].rolling(w).mean()
         df[f"ema_{w}"] = df["close_kf"].ewm(span=w, adjust=False).mean()
-
-    df["roc_5"] = df["close_kf"].pct_change(5)
-
-    for w in (5, 20, 60):
+        df[f"price_to_sma_{w}"] = df["close_kf"] / df[f"sma_{w}"]
+    
+    # Volatility
+    for w in [5, 20, 60]:
         df[f"vol_{w}"] = df["ret_1"].rolling(w).std()
-
-    # RSI-ish
+    
+    # RSI
     delta = df["close_kf"].diff()
     up = delta.clip(lower=0)
     down = -delta.clip(upper=0)
-    roll_up = up.ewm(com=13).mean()
-    roll_down = down.ewm(com=13).mean()
+    roll_up = up.ewm(com=13, adjust=False).mean()
+    roll_down = down.ewm(com=13, adjust=False).mean()
     df["rsi_14"] = 100 - 100 / (1 + roll_up / (roll_down + 1e-12))
-
-    for lag in (1, 2, 3, 5, 10):
+    
+    # OHLC features (if available)
+    if "High" in df.columns and "Low" in df.columns:
+        df["hl_range"] = (df["High"] - df["Low"]) / df["Close"]
+        df["hl_avg"] = (df["High"] + df["Low"]) / 2
+        
+    if "Open" in df.columns:
+        df["open_close_diff"] = (df["Close"] - df["Open"]) / df["Open"]
+    
+    if "Volume" in df.columns:
+        df["vol_ma_5"] = df["Volume"].rolling(5).mean()
+        df["vol_ratio"] = df["Volume"] / (df["vol_ma_5"] + 1)
+    
+    # Lagged features
+    for lag in [1, 2, 3, 5, 10]:
         df[f"ret_lag_{lag}"] = df["ret_1"].shift(lag)
         df[f"close_lag_{lag}"] = df["close_kf"].shift(lag)
-
-    df = df.dropna().reset_index(drop=True)
-
-    # targets
-    df["target_ret_1"] = df["close_kf"].shift(-1) / df["close_kf"] - 1.0
-    df["target_dir_1"] = (df["target_ret_1"] > 0).astype(int)
-    df = df.dropna(subset=["target_ret_1", "target_dir_1"]).reset_index(drop=True)
+    
+    # Momentum
+    df["momentum_5"] = df["close_kf"] - df["close_kf"].shift(5)
+    df["momentum_10"] = df["close_kf"] - df["close_kf"].shift(10)
+    
     return df
 
-# ---------------------------
-# Sidebar - file + options
-# ---------------------------
-with st.sidebar:
-    st.header("Input & Options")
-    uploaded = st.file_uploader("Upload MCX CSV (optional)", type=["csv"])
-    use_default = st.checkbox("Use default path if available (/mnt/data/...)", value=True)
-    seq_len = st.slider("Sequence length for LSTM (if used)", min_value=10, max_value=120, value=30)
-    train_frac = st.slider("Training fraction (initial batch)", min_value=0.5, max_value=0.9, value=0.7)
-    use_lstm = st.checkbox("Attempt LSTM baseline (requires tensorflow)", value=False)
-    run_button = st.button("Run streaming sim")
+def load_and_prepare_data(uploaded_file=None, file_path=None):
+    """Load and prepare data from file"""
+    # Load data
+    if uploaded_file is not None:
+        df_raw = pd.read_csv(uploaded_file)
+    elif file_path is not None:
+        df_raw = pd.read_csv(file_path)
+    else:
+        return None
+    
+    # Normalize column names
+    df_raw.columns = [re.sub(r"[^0-9A-Za-z]+", "_", str(c)).strip("_").lower() for c in df_raw.columns]
+    
+    # Identify columns
+    date_col = next((c for c in df_raw.columns if "date" in c), df_raw.columns[0])
+    price_col = next((c for c in df_raw.columns if "price" in c or "close" in c), None)
+    open_col = next((c for c in df_raw.columns if "open" in c), None)
+    high_col = next((c for c in df_raw.columns if "high" in c), None)
+    low_col = next((c for c in df_raw.columns if "low" in c), None)
+    vol_col = next((c for c in df_raw.columns if "vol" in c), None)
+    
+    # Create clean dataframe
+    cols_to_keep = [date_col]
+    rename_map = {date_col: "Date"}
+    
+    if price_col:
+        cols_to_keep.append(price_col)
+        rename_map[price_col] = "Close"
+    if open_col:
+        cols_to_keep.append(open_col)
+        rename_map[open_col] = "Open"
+    if high_col:
+        cols_to_keep.append(high_col)
+        rename_map[high_col] = "High"
+    if low_col:
+        cols_to_keep.append(low_col)
+        rename_map[low_col] = "Low"
+    if vol_col:
+        cols_to_keep.append(vol_col)
+        rename_map[vol_col] = "Volume"
+    
+    df = df_raw[cols_to_keep].rename(columns=rename_map)
+    
+    # Parse and clean data
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+    for col in df.columns:
+        if col != "Date":
+            df[col] = df[col].apply(safe_numeric)
+    
+    df = df.dropna(subset=["Date", "Close"]).sort_values("Date").reset_index(drop=True)
+    
+    return df
 
-# ---------------------------
-# Load data
-# ---------------------------
-df_raw = None
-source = None
+def train_models(df, train_frac=0.7, use_xgboost=True):
+    """Train all models and return results"""
+    
+    # Engineer features
+    df = engineer_features(df)
+    df = df.dropna().reset_index(drop=True)
+    
+    # Create targets
+    df["target_ret"] = df["close_kf"].shift(-1) / df["close_kf"] - 1.0
+    df["target_dir"] = (df["target_ret"] > 0).astype(int)
+    df = df.dropna(subset=["target_ret", "target_dir"]).reset_index(drop=True)
+    
+    # Feature matrix
+    exclude = ["Date", "Close", "close_kf", "target_ret", "target_dir", "Open", "High", "Low", "Volume"]
+    feature_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    
+    X = df[feature_cols].values
+    y_reg = df["target_ret"].values
+    y_dir = df["target_dir"].values
+    dates = df["Date"].values
+    
+    # Split data
+    train_n = int(len(X) * train_frac)
+    X_train = X[:train_n]
+    X_test = X[train_n:]
+    y_reg_train = y_reg[:train_n]
+    y_reg_test = y_reg[train_n:]
+    y_dir_train = y_dir[:train_n]
+    y_dir_test = y_dir[train_n:]
+    dates_test = dates[train_n:]
+    
+    # Scale
+    scaler = StandardScaler().fit(X_train)
+    X_train_s = scaler.transform(X_train)
+    X_test_s = scaler.transform(X_test)
+    
+    # Save scaler and feature columns
+    joblib.dump(scaler, os.path.join(OUT_DIR, "scaler.joblib"))
+    joblib.dump(feature_cols, os.path.join(OUT_DIR, "feature_cols.joblib"))
+    
+    # Initialize online models (loss='log_loss' enables predict_proba)
+    online_reg = SGDRegressor(max_iter=1000, tol=1e-3, random_state=42)
+    online_clf = SGDClassifier(loss='log_loss', max_iter=1000, tol=1e-3, random_state=42)
+    
+    init_n = min(50, len(X_train_s))
+    online_reg.partial_fit(X_train_s[:init_n], y_reg_train[:init_n])
+    online_clf.partial_fit(X_train_s[:init_n], y_dir_train[:init_n], classes=np.array([0, 1]))
+    
+    # Train on full training data
+    for i in range(init_n, len(X_train_s), 100):
+        batch_end = min(i + 100, len(X_train_s))
+        online_reg.partial_fit(X_train_s[i:batch_end], y_reg_train[i:batch_end])
+        online_clf.partial_fit(X_train_s[i:batch_end], y_dir_train[i:batch_end])
+    
+    # Streaming simulation
+    online_results = []
+    for i in range(len(X_test_s)):
+        x_t = X_test_s[i].reshape(1, -1)
+        
+        pred_mag = online_reg.predict(x_t)[0]
+        pred_dir = online_clf.predict(x_t)[0]
+        
+        true_mag = y_reg_test[i]
+        true_dir = y_dir_test[i]
+        
+        online_results.append({
+            "date": dates_test[i],
+            "true_mag": true_mag,
+            "true_dir": int(true_dir),
+            "pred_mag": pred_mag,
+            "pred_dir": int(pred_dir)
+        })
+        
+        online_reg.partial_fit(x_t, np.array([true_mag]))
+        online_clf.partial_fit(x_t, np.array([true_dir]))
+    
+    # Evaluate
+    online_df = pd.DataFrame(online_results)
+    mse = mean_squared_error(online_df["true_mag"], online_df["pred_mag"])
+    mae = mean_absolute_error(online_df["true_mag"], online_df["pred_mag"])
+    acc = accuracy_score(online_df["true_dir"], online_df["pred_dir"])
+    f1 = f1_score(online_df["true_dir"], online_df["pred_dir"])
+    
+    # Save final models
+    joblib.dump(online_reg, os.path.join(OUT_DIR, "online_reg_model.joblib"))
+    joblib.dump(online_clf, os.path.join(OUT_DIR, "online_clf_model.joblib"))
+    
+    # XGBoost (optional)
+    xgb_metrics = None
+    if use_xgboost:
+        try:
+            import xgboost as xgb
+            dtrain = xgb.DMatrix(X_train_s, label=y_dir_train)
+            dtest = xgb.DMatrix(X_test_s, label=y_dir_test)
+            
+            params = {
+                "objective": "binary:logistic",
+                "eta": 0.05,
+                "max_depth": 4,
+                "eval_metric": "auc",
+                "seed": 42
+            }
+            
+            bst = xgb.train(params, dtrain, num_boost_round=100, verbose_eval=False)
+            y_prob = bst.predict(dtest)
+            y_pred = (y_prob >= 0.5).astype(int)
+            
+            xgb_acc = accuracy_score(y_dir_test, y_pred)
+            xgb_f1 = f1_score(y_dir_test, y_pred)
+            xgb_auc = roc_auc_score(y_dir_test, y_prob)
+            
+            xgb_metrics = {"accuracy": xgb_acc, "f1": xgb_f1, "auc": xgb_auc}
+            bst.save_model(os.path.join(OUT_DIR, "xgb_model.json"))
+        except:
+            pass
+    
+    return {
+        "online_df": online_df,
+        "metrics": {"mse": mse, "mae": mae, "accuracy": acc, "f1": f1},
+        "xgb_metrics": xgb_metrics,
+        "feature_cols": feature_cols,
+        "df_full": df
+    }
 
-if uploaded is not None:
+def predict_tomorrow(df):
+    """Predict tomorrow's price direction and magnitude (FIXED VERSION)"""
+
+    # Load models
     try:
-        df_raw = pd.read_csv(uploaded)
-        source = "uploaded file"
-    except Exception as e:
-        st.error("Failed to read uploaded file: " + str(e))
-elif use_default:
-    df_raw, source = default_load_csv()
-    if df_raw is None:
-        st.info("No default CSV found; please upload a CSV.")
-else:
-    st.info("Upload a CSV or enable default path.")
+        scaler = joblib.load(os.path.join(OUT_DIR, "scaler.joblib"))
+        online_reg = joblib.load(os.path.join(OUT_DIR, "online_reg_model.joblib"))
+        online_clf = joblib.load(os.path.join(OUT_DIR, "online_clf_model.joblib"))
+        feature_cols = joblib.load(os.path.join(OUT_DIR, "feature_cols.joblib"))
+    except:
+        return None
 
-if df_raw is not None:
-    st.success(f"Loaded data from: {source}")
-    st.write("Preview:")
-    st.dataframe(df_raw.head(6))
+    # Engineer features
+    df_feat = engineer_features(df).dropna()
+    if len(df_feat) == 0:
+        return None
 
-# ---------------------------
-# Main pipeline + streaming simulation
-# ---------------------------
-if df_raw is not None and run_button:
-    with st.spinner("Preparing features and running streaming simulation..."):
-        df = prepare_features(df_raw)
-        st.write(
-            f"Prepared features. Date range: {df['Date'].iloc[0].date()} → {df['Date'].iloc[-1].date()}"
-        )
-        st.write("Sample after feature prep:")
-        st.dataframe(df.head(5))
+    latest = df_feat.iloc[-1]
 
-        # feature matrix
-        exclude = ["Date", "Close", "close_kf", "target_ret_1", "target_dir_1"]
-        feature_cols = [
-            c
-            for c in df.columns
-            if c not in exclude and pd.api.types.is_numeric_dtype(df[c])
-        ]
-        X = df[feature_cols].values
-        y_reg = df["target_ret_1"].values
-        y_clf = df["target_dir_1"].values
-        dates = df["Date"].values
+    # ✅ LAST TRADING DAY
+    latest_date = latest["Date"]
+    tomorrow_date = latest_date + timedelta(days=1)
 
-        n = len(X)
-        train_n = int(n * train_frac)
-        X_train, X_test = X[:train_n], X[train_n:]
-        y_reg_train, y_reg_test = y_reg[:train_n], y_reg[train_n:]
-        y_clf_train, y_clf_test = y_clf[:train_n], y_clf[train_n:]
-        dates_train, dates_test = dates[:train_n], dates[train_n:]
+    # ✅ USE RAW EXCEL CLOSE (NOT Kalman)
+    current_price = latest["Close"]
 
-        scaler = StandardScaler().fit(X_train)
-        X_train_s = scaler.transform(X_train)
-        X_test_s = scaler.transform(X_test)
+    # Extract features
+    X_latest = np.array([latest[feature_cols].values])
+    X_latest_s = scaler.transform(X_latest)
 
-        # Attempt to load pre-saved models (optional)
-        saved_dir_candidates = [
-            "/mnt/data/streaming_model_results",
-            "/content/streaming_model_results",
-        ]
-        saved_loaded = False
-        model_info = {"online_reg": None, "online_clf": None, "scaler": None, "lstm": None}
-        for d in saved_dir_candidates:
-            try:
-                if os.path.exists(os.path.join(d, "scaler.joblib")):
-                    model_info["scaler"] = joblib.load(os.path.join(d, "scaler.joblib"))
-                if os.path.exists(os.path.join(d, "lstm_return_model.keras")) and use_lstm:
-                    import tensorflow as tf
-                    model_info["lstm"] = tf.keras.models.load_model(
-                        os.path.join(d, "lstm_return_model.keras")
-                    )
-                saved_loaded = True
-            except Exception:
-                pass
+    # Predict return
+    pred_ret = online_reg.predict(X_latest_s)[0]
 
-        # Build online models and initialize
-        online_reg = SGDRegressor(max_iter=1000, tol=1e-3)
-        online_clf = SGDClassifier(max_iter=1000, tol=1e-3)
-        init_n = min(50, len(X_train_s))
-        if init_n <= 2:
-            st.error(
-                "Not enough training rows to initialize online model. Increase data or reduce train fraction."
-            )
-        online_reg.partial_fit(X_train_s[:init_n], y_reg_train[:init_n])
-        online_clf.partial_fit(
-            X_train_s[:init_n], y_clf_train[:init_n], classes=np.array([0, 1])
-        )
+    # Predict direction
+    pred_dir = online_clf.predict(X_latest_s)[0]
 
-        # If user requests LSTM baseline, try to train (may take time)
-        lstm_model = None
-        if use_lstm:
-            try:
-                import tensorflow as tf
-                from tensorflow.keras import layers, models, callbacks
+    # ✅ CONSISTENCY FIX (VERY IMPORTANT)
+    if pred_ret < 0:
+        pred_dir = 0
+    else:
+        pred_dir = 1
 
-                tf.random.set_seed(42)
+    # Direction probability
+    try:
+        pred_dir_proba = online_clf.predict_proba(X_latest_s)[0]
+    except:
+        pred_dir_proba = np.array([0.5, 0.5])
 
-                def make_sequences(Xa, seq_len):
-                    Xs = []
-                    for i in range(seq_len, len(Xa)):
-                        Xs.append(Xa[i - seq_len : i])
-                    return np.array(Xs)
+    # ✅ PRICE PREDICTION BASED ON RAW CLOSE
+    pred_price = current_price * (1 + pred_ret)
 
-                scaled_all = scaler.transform(X)
-                Xs_all = make_sequences(scaled_all, seq_len)
-                yseq_all = y_reg[seq_len:]
-                seq_train_n = int(len(Xs_all) * 0.7)
-                Xs_train = Xs_all[:seq_train_n]
-                yseq_train = yseq_all[:seq_train_n]
+    # XGBoost (unchanged)
+    xgb_pred = None
+    try:
+        import xgboost as xgb
+        bst = xgb.Booster()
+        bst.load_model(os.path.join(OUT_DIR, "xgb_model.json"))
+        dpredict = xgb.DMatrix(X_latest_s)
+        xgb_prob = float(bst.predict(dpredict)[0])
+        xgb_dir = 1 if xgb_prob >= 0.5 else 0
+        xgb_pred = {"direction": xgb_dir, "probability": xgb_prob}
+    except:
+        pass
 
-                inp = layers.Input(shape=(seq_len, Xs_train.shape[2]))
-                x = layers.Bidirectional(layers.LSTM(32, return_sequences=False))(inp)
-                x = layers.Dropout(0.2)(x)
-                x = layers.Dense(16, activation="relu")(x)
-                out = layers.Dense(1, activation="linear")(x)
-                lstm_model = models.Model(inp, out)
-                lstm_model.compile(optimizer="adam", loss="mse")
-                es = callbacks.EarlyStopping(
-                    monitor="val_loss", patience=4, restore_best_weights=True
-                )
-                lstm_model.fit(
-                    Xs_train,
-                    yseq_train,
-                    validation_split=0.1,
-                    epochs=20,
-                    batch_size=32,
-                    callbacks=[es],
-                    verbose=0,
-                )
-                st.success("LSTM baseline trained.")
-            except Exception as e:
-                st.warning(
-                    "LSTM training failed or tensorflow not available: " + str(e)
-                )
-                lstm_model = None
+    return {
+        "current_date": latest_date,
+        "current_price": current_price,
+        "predicted_return": pred_ret,
+        "predicted_direction": int(pred_dir),
+        "direction_probability": pred_dir_proba,
+        "predicted_price": pred_price,
+        "xgb_prediction": xgb_pred,
+        "tomorrow_date": tomorrow_date
+    }
 
-        # Streaming simulation over the test set
-        results = []
-        preds_online_reg = []
-        preds_online_clf = []
-        preds_lstm_reg = []
+# ============================================================================
+# STREAMLIT APP
+# ============================================================================
 
-        for i in range(len(X_test_s)):
-            x_t = X_test_s[i].reshape(1, -1)
+st.set_page_config(page_title="MCX Silver Predictor", layout="wide", page_icon="📈")
 
-            pred_mag_online = online_reg.predict(x_t)[0]
-            pred_dir_online = online_clf.predict(x_t)[0]
+st.title("📈 MCX Silver Price Prediction System")
+st.markdown("---")
 
-            preds_online_reg.append(pred_mag_online)
-            preds_online_clf.append(int(pred_dir_online))
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Configuration")
+    
+    uploaded_file = st.file_uploader("Upload MCX Silver CSV", type=["csv"])
+    
+    st.markdown("### Training Parameters")
+    train_frac = st.slider("Training Data Fraction", 0.5, 0.9, 0.7, 0.05)
+    use_xgboost = st.checkbox("Use XGBoost (slower)", value=True)
+    
+    train_button = st.button("🚀 Train Models", type="primary", use_container_width=True)
+    predict_button = st.button("🔮 Predict Tomorrow", use_container_width=True)
+    
+    st.markdown("---")
+    st.markdown("### About")
+    st.info("This system uses online learning and XGBoost to predict MCX Silver prices.")
 
-            # LSTM pred if available (sequence ending at absolute index)
-            if lstm_model is not None:
-                abs_idx = train_n + i
-                if abs_idx - seq_len + 1 >= 0:
-                    seq = scaler.transform(X)[abs_idx - seq_len + 1 : abs_idx + 1]
-                    if seq.shape[0] == seq_len:
-                        seq = seq.reshape(1, seq_len, seq.shape[1])
-                        try:
-                            pred_l = float(lstm_model.predict(seq, verbose=0)[0, 0])
-                        except Exception:
-                            pred_l = np.nan
+# Main content
+if uploaded_file is not None:
+    
+    # Load data
+    df = load_and_prepare_data(uploaded_file=uploaded_file)
+    
+    if df is not None:
+        st.success(f"✅ Data loaded: {len(df)} rows")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Records", len(df))
+        col2.metric("Date Range", f"{df['Date'].min().date()} to {df['Date'].max().date()}")
+        col3.metric("Current Price", f"₹{df['Close'].iloc[-1]:.2f}")
+        col4.metric("Last Change", f"{((df['Close'].iloc[-1]/df['Close'].iloc[-2]-1)*100):.2f}%")
+        
+        # Show data preview
+        with st.expander("📊 Data Preview"):
+            st.dataframe(df.tail(10), use_container_width=True)
+        
+        # Train models
+        if train_button:
+            with st.spinner("Training models... This may take a minute."):
+                results = train_models(df, train_frac=train_frac, use_xgboost=use_xgboost)
+                
+                st.session_state['results'] = results
+                st.session_state['df'] = df
+                
+                st.success("✅ Models trained successfully!")
+        
+        # Display results if available
+        if 'results' in st.session_state:
+            results = st.session_state['results']
+            
+            st.markdown("---")
+            st.header("📊 Model Performance")
+            
+            # Metrics
+            col1, col2, col3, col4 = st.columns(4)
+            metrics = results['metrics']
+            col1.metric("Accuracy", f"{metrics['accuracy']:.2%}")
+            col2.metric("F1 Score", f"{metrics['f1']:.4f}")
+            col3.metric("MAE", f"{metrics['mae']:.6f}")
+            col4.metric("MSE", f"{metrics['mse']:.2e}")
+            
+            if results['xgb_metrics']:
+                st.markdown("#### XGBoost Performance")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("XGB Accuracy", f"{results['xgb_metrics']['accuracy']:.2%}")
+                col2.metric("XGB F1", f"{results['xgb_metrics']['f1']:.4f}")
+                col3.metric("XGB AUC", f"{results['xgb_metrics']['auc']:.4f}")
+            
+            # Visualizations
+            st.markdown("---")
+            st.header("📈 Performance Visualizations")
+            
+            online_df = results['online_df']
+            
+            # Time series
+            tab1, tab2, tab3, tab4 = st.tabs(["Time Series", "Scatter Plot", "Rolling Accuracy", "Strategy Returns"])
+            
+            with tab1:
+                window = min(300, len(online_df))
+                fig, ax = plt.subplots(figsize=(14, 5))
+                ax.plot(pd.to_datetime(online_df["date"][-window:]), 
+                        online_df["true_mag"][-window:], 
+                        label="True", linewidth=1.5, alpha=0.8)
+                ax.plot(pd.to_datetime(online_df["date"][-window:]), 
+                        online_df["pred_mag"][-window:], 
+                        label="Predicted", linewidth=1.5, alpha=0.8)
+                ax.legend(fontsize=12)
+                ax.set_title(f"True vs Predicted Returns (Last {window} Days)", fontsize=14)
+                ax.set_ylabel("Return", fontsize=12)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+            
+            with tab2:
+                fig, ax = plt.subplots(figsize=(8, 6))
+                ax.scatter(online_df["true_mag"], online_df["pred_mag"], alpha=0.4, s=20)
+                ax.plot([-0.05, 0.05], [-0.05, 0.05], 'r--', alpha=0.5, linewidth=2)
+                ax.set_xlabel("True Return", fontsize=12)
+                ax.set_ylabel("Predicted Return", fontsize=12)
+                ax.set_title("Predicted vs True Returns", fontsize=14)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+            
+            with tab3:
+                online_df["correct"] = (online_df["true_dir"] == online_df["pred_dir"]).astype(int)
+                online_df["rolling_acc"] = online_df["correct"].rolling(50, min_periods=1).mean()
+                
+                fig, ax = plt.subplots(figsize=(14, 5))
+                ax.plot(pd.to_datetime(online_df["date"]), online_df["rolling_acc"], linewidth=2)
+                ax.axhline(0.5, color='r', linestyle='--', alpha=0.5, linewidth=2)
+                ax.fill_between(pd.to_datetime(online_df["date"]), 0.5, online_df["rolling_acc"], 
+                               where=(online_df["rolling_acc"] > 0.5), alpha=0.3, color='green')
+                ax.set_ylim(0, 1)
+                ax.set_ylabel("Accuracy", fontsize=12)
+                ax.set_title("Rolling Direction Prediction Accuracy (Window=50)", fontsize=14)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+            
+            with tab4:
+                online_df["strategy_ret"] = online_df["pred_dir"] * online_df["true_mag"]
+                online_df["cum_strategy"] = (1 + online_df["strategy_ret"]).cumprod() - 1
+                online_df["cum_hold"] = (1 + online_df["true_mag"]).cumprod() - 1
+                
+                fig, ax = plt.subplots(figsize=(14, 6))
+                ax.plot(pd.to_datetime(online_df["date"]), 
+                        online_df["cum_strategy"] * 100, 
+                        label="Strategy", linewidth=2.5)
+                ax.plot(pd.to_datetime(online_df["date"]), 
+                        online_df["cum_hold"] * 100, 
+                        label="Buy & Hold", linewidth=2.5, alpha=0.7)
+                ax.axhline(0, color='k', linestyle='-', alpha=0.3, linewidth=0.5)
+                ax.fill_between(pd.to_datetime(online_df["date"]), 0, online_df["cum_strategy"] * 100,
+                               alpha=0.3)
+                ax.set_ylabel("Cumulative Return (%)", fontsize=12)
+                ax.set_title("Strategy Performance: Model vs Buy & Hold", fontsize=14)
+                ax.legend(fontsize=12)
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                st.pyplot(fig)
+                
+                # Strategy stats
+                final_strategy = online_df["cum_strategy"].iloc[-1] * 100
+                final_hold = online_df["cum_hold"].iloc[-1] * 100
+                outperformance = final_strategy - final_hold
+                
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Strategy Return", f"{final_strategy:.2f}%")
+                col2.metric("Buy & Hold Return", f"{final_hold:.2f}%")
+                col3.metric("Outperformance", f"{outperformance:.2f}%", 
+                           delta=f"{outperformance:.2f}%")
+        
+        # Tomorrow's prediction
+        if predict_button:
+            if 'results' not in st.session_state:
+                st.error("⚠️ Please train the models first!")
+            else:
+                with st.spinner("Predicting tomorrow's price..."):
+                    prediction = predict_tomorrow(df)
+                    
+                    if prediction:
+                        st.markdown("---")
+                        
+                        # ONE-LINE PREDICTION BANNER
+                        direction_emoji = "📈" if prediction['predicted_direction'] == 1 else "📉"
+                        direction_text = "UP" if prediction['predicted_direction'] == 1 else "DOWN"
+                        price_change_pct = prediction['predicted_return'] * 100
+                        confidence = prediction['direction_probability'][prediction['predicted_direction']] * 100
+                        
+                        # Color based on direction
+                        if prediction['predicted_direction'] == 1:
+                            banner_color = "#00ff00"  # Green for UP
+                            text_color = "#006400"
+                        else:
+                            banner_color = "#ff4444"  # Red for DOWN
+                            text_color = "#8B0000"
+                        
+                        st.markdown(f"""
+                        <div style="background-color: {banner_color}; padding: 20px; border-radius: 10px; text-align: center; margin-bottom: 20px;">
+                            <h1 style="color: {text_color}; margin: 0; font-size: 2.5em;">
+                                {direction_emoji} Tomorrow's Market Trend: <b>{direction_text}</b> by <b>{abs(price_change_pct):.2f}%</b> {direction_emoji}
+                            </h1>
+                            <p style="color: {text_color}; margin: 10px 0 0 0; font-size: 1.2em;">
+                                Confidence: {confidence:.1f}% | Predicted Price: ₹{prediction['predicted_price']:.2f}
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.header("🔮 Detailed Prediction")
+                        
+                        # Prediction display
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            st.markdown("### 📅 Current Status")
+                            st.metric("Date", prediction['current_date'].strftime('%Y-%m-%d'))
+                            st.metric("Current Price", f"₹{prediction['current_price']:.2f}")
+                        
+                        with col2:
+                            st.markdown("### 🎯 Tomorrow's Forecast")
+                            st.metric("Predicted Date", prediction['tomorrow_date'].strftime('%Y-%m-%d'))
+                            
+                            direction_text = "📈 UP" if prediction['predicted_direction'] == 1 else "📉 DOWN"
+                            confidence = prediction['direction_probability'][prediction['predicted_direction']] * 100
+                            
+                            st.metric("Direction", direction_text)
+                            st.metric("Confidence", f"{confidence:.1f}%")
+                        
+                        # Price prediction
+                        st.markdown("---")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        price_change = prediction['predicted_price'] - prediction['current_price']
+                        price_change_pct = (price_change / prediction['current_price']) * 100
+                        
+                        col1.metric("Predicted Price", f"₹{prediction['predicted_price']:.2f}")
+                        col2.metric("Expected Change", f"₹{price_change:.2f}", 
+                                   delta=f"{price_change_pct:.2f}%")
+                        col3.metric("Expected Return", f"{prediction['predicted_return']*100:.2f}%")
+                        
+                        # XGBoost prediction if available
+                        if prediction['xgb_prediction']:
+                            st.markdown("---")
+                            st.markdown("### 🎯 XGBoost Prediction")
+                            xgb_dir = "📈 UP" if prediction['xgb_prediction']['direction'] == 1 else "📉 DOWN"
+                            xgb_conf = prediction['xgb_prediction']['probability'] * 100
+                            
+                            col1, col2 = st.columns(2)
+                            col1.metric("XGB Direction", xgb_dir)
+                            col2.metric("XGB Confidence", f"{xgb_conf:.1f}%")
+                        
+                        # Recommendation
+                        st.markdown("---")
+                        st.markdown("### 💡 Trading Recommendation")
+                        
+                        if confidence > 65:
+                            if prediction['predicted_direction'] == 1:
+                                st.success(f"🟢 **STRONG BUY** signal with {confidence:.1f}% confidence. Expected gain: {price_change_pct:.2f}%")
+                            else:
+                                st.error(f"🔴 **STRONG SELL** signal with {confidence:.1f}% confidence. Expected loss: {price_change_pct:.2f}%")
+                        elif confidence > 55:
+                            if prediction['predicted_direction'] == 1:
+                                st.info(f"🟡 **BUY** signal with moderate confidence ({confidence:.1f}%). Expected gain: {price_change_pct:.2f}%")
+                            else:
+                                st.warning(f"🟡 **SELL** signal with moderate confidence ({confidence:.1f}%). Expected loss: {price_change_pct:.2f}%")
+                        else:
+                            st.warning(f"⚪ **NEUTRAL** - Low confidence ({confidence:.1f}%). Consider waiting for clearer signals.")
+                        
+                        st.caption("⚠️ Happy Every Time !! ")
                     else:
-                        pred_l = np.nan
-                else:
-                    pred_l = np.nan
-                preds_lstm_reg.append(pred_l)
+                        st.error("Failed to generate prediction. Please ensure models are trained.")
 
-            true_mag = y_reg_test[i]
-            true_dir = int(y_clf_test[i])
+else:
+    st.info("👈 Please upload a CSV file to get started")
+    
+    st.markdown("### 📋 Required CSV Format")
+    st.code("""
+Date,Price,Open,High,Low,Vol.,Change %
+2024-01-01,75000,74800,75200,74500,1000,0.5%
+2024-01-02,75500,75000,76000,74900,1200,0.67%
+...
+    """)
+    
+    st.markdown("### 🎯 Features")
+    st.markdown("""
+    - **Real-time prediction** for tomorrow's price
+    - **Dual model approach**: Online Learning + XGBoost
+    - **Comprehensive metrics**: Accuracy, F1, AUC, MAE, MSE
+    - **Visual analytics**: Time series, scatter plots, rolling accuracy
+    - **Strategy comparison**: Model predictions vs Buy & Hold
+    - **Confidence scores** for each prediction
+    """)
 
-            results.append(
-                {
-                    "date": dates_test[i],
-                    "true_mag": true_mag,
-                    "true_dir": true_dir,
-                    "pred_online_mag": pred_mag_online,
-                    "pred_online_dir": int(pred_dir_online),
-                    "pred_lstm_mag": preds_lstm_reg[-1] if lstm_model is not None else np.nan,
-                }
-            )
-
-            # update online models with the true label (simulate learning)
-            online_reg.partial_fit(x_t, np.array([true_mag]))
-            online_clf.partial_fit(x_t, np.array([true_dir]))
-
-        res_df = pd.DataFrame(results)
-
-        # metrics
-        mse_online = mean_squared_error(res_df["true_mag"], res_df["pred_online_mag"])
-        mae_online = mean_absolute_error(res_df["true_mag"], res_df["pred_online_mag"])
-        acc_online = accuracy_score(res_df["true_dir"], res_df["pred_online_dir"])
-        f1_online = f1_score(res_df["true_dir"], res_df["pred_online_dir"])
-
-        if lstm_model is not None and res_df["pred_lstm_mag"].notna().sum() > 0:
-            valid_mask = ~np.isnan(res_df["pred_lstm_mag"])
-            mse_lstm = mean_squared_error(
-                res_df["true_mag"][valid_mask], res_df["pred_lstm_mag"][valid_mask]
-            )
-            mae_lstm = mean_absolute_error(
-                res_df["true_mag"][valid_mask], res_df["pred_lstm_mag"][valid_mask]
-            )
-        else:
-            mse_lstm = np.nan
-            mae_lstm = np.nan
-
-        # ---------------------------
-        # Performance Summary tables
-        # ---------------------------
-        st.subheader("Performance Summary (Regression, stream-test)")
-        summary_reg = pd.DataFrame([
-            {"Model": "Online (SGDReg)", "MSE": mse_online, "MAE": mae_online},
-            {"Model": "LSTM (batch)",    "MSE": mse_lstm,  "MAE": mae_lstm},
-        ])
-        st.dataframe(summary_reg.style.format({"MSE": "{:.3e}", "MAE": "{:.6f}"}))
-
-        st.subheader("Performance Summary (Classification, stream-test)")
-        summary_cls = pd.DataFrame([
-            {"Model": "Online (SGDClf)", "Accuracy": acc_online, "F1": f1_online}
-        ])
-        st.dataframe(summary_cls.style.format({"Accuracy": "{:.4f}", "F1": "{:.4f}"}))
-
-        # Latest prediction box
-        st.subheader("Latest Prediction")
-        latest = res_df.iloc[-1]
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Date", str(pd.to_datetime(latest["date"]).date()))
-        col2.metric(
-            "Predicted Direction",
-            "UP" if latest["pred_online_dir"] == 1 else "DOWN",
-        )
-        col3.metric(
-            "Predicted Next-Day Return",
-            f"{latest['pred_online_mag'] * 100:.3f}%",
-        )
-
-        # Plots: pred vs true scatter, time series, rolling accuracy, cumulative returns
-        st.subheader("Diagnostics & Plots")
-
-        # 1) scatter
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.scatter(res_df["true_mag"], res_df["pred_online_mag"], alpha=0.4, s=8)
-        ax.set_xlabel("True next-day return")
-        ax.set_ylabel("Predicted (online)")
-        ax.set_title("Predicted vs True (online reg)")
-        st.pyplot(fig)
-
-        # 2) timeseries (last 400 points)
-        maxpts = min(400, len(res_df))
-        fig2, ax2 = plt.subplots(figsize=(10, 3))
-        ax2.plot(
-            pd.to_datetime(res_df["date"][-maxpts:]),
-            res_df["true_mag"][-maxpts:],
-            label="true",
-            linewidth=1,
-        )
-        ax2.plot(
-            pd.to_datetime(res_df["date"][-maxpts:]),
-            res_df["pred_online_mag"][-maxpts:],
-            label="online_pred",
-            linewidth=1,
-        )
-        if lstm_model is not None:
-            ax2.plot(
-                pd.to_datetime(res_df["date"][-maxpts:]),
-                res_df["pred_lstm_mag"][-maxpts:],
-                label="lstm_pred",
-                linewidth=1,
-            )
-        ax2.legend()
-        ax2.set_title("True vs Predictions (recent)")
-        st.pyplot(fig2)
-
-        # 3) rolling accuracy for direction
-        res_df["correct_online_dir"] = (
-            res_df["true_dir"] == res_df["pred_online_dir"]
-        ).astype(int)
-        res_df["rolling_acc_online"] = res_df["correct_online_dir"].rolling(
-            50, min_periods=1
-        ).mean()
-        fig3, ax3 = plt.subplots(figsize=(10, 2))
-        ax3.plot(
-            pd.to_datetime(res_df["date"]),
-            res_df["rolling_acc_online"],
-            label="rolling_acc_online",
-        )
-        ax3.axhline(0.5, linestyle="--", color="k", alpha=0.6)
-        ax3.set_ylim(0, 1)
-        ax3.set_title("Rolling accuracy (window=50)")
-        st.pyplot(fig3)
-
-        # 4) cumulative returns: strategy vs buy & hold
-        strat_online = (
-            res_df["pred_online_dir"].astype(int) * res_df["true_mag"]
-        ).fillna(0)
-        cum_strat_online = np.cumprod(1 + strat_online) - 1
-        cum_hold = np.cumprod(1 + res_df["true_mag"]) - 1
-        fig4, ax4 = plt.subplots(figsize=(10, 3))
-        ax4.plot(
-            pd.to_datetime(res_df["date"]),
-            cum_strat_online,
-            label="online strategy",
-        )
-        ax4.plot(
-            pd.to_datetime(res_df["date"]),
-            cum_hold,
-            label="buy & hold",
-        )
-        ax4.legend()
-        ax4.set_title("Cumulative returns")
-        st.pyplot(fig4)
-
-        # export results
-        out_dir = os.path.join(".", "streamlit_results")
-        os.makedirs(out_dir, exist_ok=True)
-        res_df.to_csv(os.path.join(out_dir, "stream_sim_results.csv"), index=False)
-        joblib.dump(
-            {
-                "summary": {
-                    "mse_online": mse_online,
-                    "mae_online": mae_online,
-                    "acc_online": acc_online,
-                    "f1_online": f1_online,
-                }
-            },
-            os.path.join(out_dir, "summary.joblib"),
-        )
-        st.success(
-            f"Streaming sim finished. Results saved to {out_dir}/stream_sim_results.csv"
-        )
-        st.info(
-            "Tip: Use transaction-cost thresholding before trading; only trade when predicted magnitude > threshold."
-        )
+# End of SILVER_MCX_Stremlit.py
